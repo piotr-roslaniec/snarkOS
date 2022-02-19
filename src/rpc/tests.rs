@@ -20,8 +20,7 @@ use crate::{
     ledger::Ledger,
     network::{Operator, Prover},
     rpc::*,
-    Environment,
-    Peers,
+    Environment, Peers,
 };
 use snarkos_storage::{
     storage::{rocksdb::RocksDB, Storage},
@@ -29,7 +28,7 @@ use snarkos_storage::{
 };
 use snarkvm::{
     dpc::{testnet2::Testnet2, Address, AleoAmount, Network, Transaction, Transactions, Transition},
-    prelude::{Account, Block, BlockHeader},
+    prelude::{Account, Block, BlockHeader, LedgerTree, Request, VirtualMachine},
     utilities::ToBytes,
 };
 
@@ -43,11 +42,13 @@ use rand::{thread_rng, Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
 use serde::{Deserialize, Serialize};
 use snarkvm::dpc::Record;
+use snarkvm::traits::LedgerTreeScheme;
 
 use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 fn temp_dir() -> std::path::PathBuf {
@@ -424,14 +425,12 @@ async fn test_get_ciphertext() {
     let response: <Testnet2 as Network>::RecordCiphertext = rpc_client.request("getciphertext", params).await.expect("Invalid response");
 
     // Check the ciphertext.
-    assert!(
-        Testnet2::genesis_block()
-            .transactions()
-            .first()
-            .unwrap()
-            .ciphertexts()
-            .any(|expected| response == *expected)
-    );
+    assert!(Testnet2::genesis_block()
+        .transactions()
+        .first()
+        .unwrap()
+        .ciphertexts()
+        .any(|expected| response == *expected));
 }
 
 #[tokio::test]
@@ -577,15 +576,13 @@ async fn test_get_transition() {
     let response: Transition<Testnet2> = rpc_client.request("gettransition", params).await.expect("Invalid response");
 
     // Check the transition.
-    assert!(
-        Testnet2::genesis_block()
-            .transactions()
-            .first()
-            .unwrap()
-            .transitions()
-            .iter()
-            .any(|expected| response == *expected)
-    );
+    assert!(Testnet2::genesis_block()
+        .transactions()
+        .first()
+        .unwrap()
+        .transitions()
+        .iter()
+        .any(|expected| response == *expected));
 }
 
 #[tokio::test]
@@ -619,6 +616,66 @@ async fn test_send_transaction() {
 
     // Send the request to the server.
     let params = rpc_params![hex::encode(transaction.to_bytes_le().unwrap())];
+
+    // TODO: Read tx: hex::encode(transaction.to_bytes_le().unwrap()
+
+    let response: <Testnet2 as Network>::TransactionID = rpc_client.request("sendtransaction", params).await.expect("Invalid response");
+
+    // Check the transaction id.
+    assert_eq!(response, transaction.transaction_id());
+}
+
+fn create_new_ledger<N: Network, S: Storage>() -> LedgerState<N> {
+    LedgerState::open_writer_with_increment::<S, _>(temp_dir(), 1).expect("Failed to initialize ledger")
+}
+
+#[tokio::test]
+async fn test_send_transaction_noop() {
+    let rng = &mut thread_rng();
+
+    let terminator = AtomicBool::new(false);
+
+    // Initialize a new ledger.
+    let ledger = create_new_ledger::<Testnet2, RocksDB>();
+    assert_eq!(0, ledger.latest_block_height());
+
+    // Initialize a new account.
+    let account = Account::<Testnet2>::new(&mut thread_rng());
+    let view_key = account.view_key();
+    let address = account.address();
+
+    // Mine the next block.
+    let (block, _record) = ledger
+        .mine_next_block(address, true, &[], &terminator, rng)
+        .expect("Failed to mine");
+    ledger.add_next_block(&block).expect("Failed to add next block to ledger");
+
+    // Craft the transaction variables.
+    let coinbase_transaction = &block.transactions()[0];
+
+    let coinbase_record = coinbase_transaction.to_decrypted_records(&view_key.into()).collect::<Vec<_>>();
+
+    let ledger_proof = ledger.get_ledger_inclusion_proof(coinbase_record[0].commitment()).unwrap();
+    let ledger_proofs = vec![ledger_proof];
+
+    // Initialize a new transaction.
+    let request = Request::new_noop(ledger_proofs, rng).unwrap();
+    let (vm, response) = VirtualMachine::<Testnet2>::new(LedgerTree::<Testnet2>::new().unwrap().root())
+        .unwrap()
+        .execute(&request, rng)
+        .unwrap();
+    let transaction = vm.finalize().unwrap();
+    // let records = response.records()[0].clone();
+
+    // Initialize a new RPC server and create an associated client.
+    let rpc_server_addr = new_rpc_server::<Testnet2, Client<Testnet2>, RocksDB>(None).await;
+    let rpc_client = new_rpc_client(rpc_server_addr);
+
+    // Send the request to the server.
+    let params = rpc_params![hex::encode(transaction.to_bytes_le().unwrap())];
+
+    // TODO: Read tx: hex::encode(transaction.to_bytes_le().unwrap()
+
     let response: <Testnet2 as Network>::TransactionID = rpc_client.request("sendtransaction", params).await.expect("Invalid response");
 
     // Check the transaction id.
